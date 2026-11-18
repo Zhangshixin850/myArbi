@@ -1,0 +1,38 @@
+services:
+  backend:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: sqlite:////app/data/arbi.db
+    restart: unless-stopped
+    volumes:
+      - ledger:/app/data
+      - backups:/app/backups
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+  web:
+    build: frontend
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+    ports: ["80:80", "443:443", "443:443/udp"]
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+volumes:
+  ledger:
+  backups:
+  caddy_data:
+  caddy_config:
