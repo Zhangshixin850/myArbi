@@ -6,7 +6,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.sqlite import insert
 
 from .adapters import DAY, ExchangeError
-from .ledger import calculate, summary
+from .ledger import (calculate, calculate_manual, manual_exposed, manual_records,
+                     manual_quantity_at, summary)
 from .models import Audit, Card, Cursor, Event, Leg, Snapshot, now_ms
 
 log = logging.getLogger('arbi')
@@ -18,14 +19,34 @@ def events_for(db, leg):
 
 
 def leg_view(db, leg, base):
-    result = calculate(events_for(db, leg), leg.direction, leg.product, base, leg.snapshot.get('mark'))
+    result = (calculate_manual(events_for(db, leg), leg.direction, leg.snapshot.get('mark')) if leg.source == 'manual'
+              else calculate(events_for(db, leg), leg.direction, leg.product, base, leg.snapshot.get('mark')))
+    result.pop('funding_estimates', None)
+    if leg.source == 'manual' and D(result['qty']) and leg.snapshot.get('rate') is None:
+        result['issues'].append('Omni 公开资金费数据不可用')
+        result['funding_complete'] = False
     return dict(id=leg.id, account=leg.account, product=leg.product, symbol=leg.symbol, direction=leg.direction,
+                source=leg.source, quote_asset=leg.quote_asset, revision=leg.manual_revision,
                 synced_at=leg.synced_at, error=leg.error, snapshot=leg.snapshot, **result)
 
 
 def card_view(db, card, settings):
     legs = [leg_view(db, leg, card.base) for leg in card.legs]
     result = summary(legs, card.closed_at or now_ms())
+    estimated = any(x['source'] == 'manual' for x in legs)
+    if estimated:
+        valid = result['complete'] and all(
+            (not x['error'] and (card.status == 'archived' or x['synced_at'] is not None
+             and now_ms() - x['synced_at'] <= settings.stale_seconds * 1000))
+            or x['source'] == 'manual' and x['closed_confirmed'] for x in legs)
+        projection = summary([dict(x, net=str(D(x['net']) + D(x.get('estimated_funding', '0')))) for x in legs],
+                             card.closed_at or now_ms())
+        result.update(complete=valid, estimated_net=projection['net'] if valid else None,
+            estimated_total=projection['total'] if valid else None,
+            estimated_annual=projection['annual'] if valid else None, annual=None,
+            funding_complete=all(x.get('funding_complete', True) for x in legs))
+        if any(x['source'] == 'manual' and not x['manual_entered'] for x in legs):
+            result['imbalance'] = None
     alerts = []
     for leg in legs:
         alerts.extend(leg['issues'])
@@ -43,10 +64,11 @@ def card_view(db, card, settings):
             alerts.append(leg['account'] + ': 接近强平价格')
         if snap.get('adl') is not None and snap['adl'] >= 3:
             alerts.append(leg['account'] + ': ADL 风险较高')
-    if D(result['imbalance']) > settings.imbalance_ratio:
+    if result['imbalance'] is not None and D(result['imbalance']) > settings.imbalance_ratio:
         alerts.append('双腿数量不平衡')
     return dict(id=card.id, base=card.base, status=card.status, started_at=card.started_at, closed_at=card.closed_at,
-                revised_at=card.revised_at, legs=legs, alerts=sorted(set(alerts)), **result)
+                revised_at=card.revised_at, legs=legs, estimated=estimated,
+                approximation='1 USDC≈1 USDT' if estimated else None, alerts=sorted(set(alerts)), **result)
 
 
 def position_for(account, symbol, direction):
@@ -71,9 +93,20 @@ class Service:
                 await adapter.fetch_markets()
                 market = adapter.markets.get(spec.symbol)
                 if market is None:
-                    raise ValueError('不支持的 USDT 市场')
+                    raise ValueError('不支持的市场或结算币种')
                 if spec.product == 'spot' and spec.direction != 'LONG':
                     raise ValueError('现货只支持多头')
+                if spec.account == 'omni':
+                    if spec.product != 'perp':
+                        raise ValueError('Omni 只支持永续')
+                    snapshot = await adapter.fetch_market_snapshot(spec.symbol)
+                    if snapshot.get('next_funding'):
+                        snapshot = dict(snapshot, funding_checkpoint=dict(snapshot))
+                    bases.append(market['base'])
+                    legs.append(Leg(account='omni', product='perp', symbol=spec.symbol, direction=spec.direction,
+                        source='manual', quote_asset='USDC', reservation='BOTH', snapshot=snapshot,
+                        baseline=dict(mode='MANUAL', balance='0')))
+                    continue
                 # Baselines always bypass account cache.
                 adapter.cache.clear()
                 account = await adapter.fetch_account_risk()
@@ -101,7 +134,151 @@ class Service:
                 db.add(Audit(card_id=card.id, message='创建卡片并记录账户基线'))
                 return card.id
 
+    def settle_omni(self, db, leg, at, market=None):
+        """Use saved pre-settlement evidence only; never interpolate missed payments."""
+        events = events_for(db, leg)
+        records = manual_records(events)
+        previous = leg.snapshot.get('funding_checkpoint')
+        key = f'{leg.id}:estimated'
+        cursor = db.get(Cursor, key)
+
+        def add(kind, external_id, timestamp, data, raw):
+            inserted = db.execute(insert(Event).values(leg_id=leg.id, account=leg.account, product=leg.product,
+                symbol=leg.symbol, kind=kind, source='estimated', external_id=external_id,
+                time=timestamp, data=data, raw=raw).on_conflict_do_nothing())
+            if inserted.rowcount:
+                db.get(Card, leg.card_id).revised_at = at
+
+        if previous:
+            node = previous['next_funding']
+            if node <= at and (cursor is None or cursor.through < node):
+                if manual_quantity_at(records, node) is not None:
+                    fresh = 0 <= node - previous['observed_at'] <= self.settings.stale_seconds * 1000
+                    if fresh:
+                        add('estimated_funding', str(node), node,
+                            dict(type='ESTIMATED_FUNDING', settlement_time=node, mark=previous['mark'],
+                                 rate=previous['rate'], asset='USDC'), previous)
+                    else:
+                        add('estimated_funding_gap', str(node), node,
+                            dict(type='ESTIMATED_FUNDING_GAP', start=node, end=node, reason='结算前快照过期'), previous)
+                    db.add(Audit(card_id=leg.card_id, message='Omni 结算节点估算' if fresh else 'Omni 结算节点漏采'))
+                if cursor is None:
+                    cursor = Cursor(key=key, through=node, audited_at=at)
+                    db.add(cursor)
+                else:
+                    cursor.through = node
+            # Closing while offline must also expose later payments we never sampled.
+            missing_start = node + previous['interval_seconds'] * 1000
+            if market is None and at >= missing_start and manual_exposed(records, missing_start, at):
+                add('estimated_funding_gap', f'offline:{missing_start}:{at}', at,
+                    dict(type='ESTIMATED_FUNDING_GAP', start=missing_start, end=at,
+                         reason='离线期间后续结算未知'), previous)
+        if market is not None:
+            observed = market['observed_at']
+            upcoming = market.get('next_funding')
+            if previous:
+                node = previous['next_funding']
+                start = node + previous['interval_seconds'] * 1000
+                changed_interval = upcoming is not None and market['interval_seconds'] != previous['interval_seconds']
+                skipped = (upcoming is not None and upcoming > start
+                           or upcoming is not None and market['interval_seconds'] != previous['interval_seconds']
+                           and observed >= node)
+                if changed_interval:
+                    start = min(node, observed)
+            else:
+                start = records[0]['time'] if records else observed
+                skipped = upcoming is not None and observed > start
+            if skipped and manual_exposed(records, start, observed):
+                add('estimated_funding_gap', f'{start}:{observed}', observed,
+                    dict(type='ESTIMATED_FUNDING_GAP', start=start, end=observed, reason='历史结算节点不可恢复'),
+                    dict(previous=previous, current=market))
+                db.add(Audit(card_id=leg.card_id, message='Omni 公开数据恢复，保留不可恢复的资金费区间'))
+            if upcoming is not None and upcoming > observed:
+                previous = market
+            leg.snapshot = dict(market, funding_checkpoint=previous)
+
+    async def save_manual(self, card_id, leg_id, body):
+        payload = body.model_dump(mode='json')
+        async with self.lock:
+            with self.sessions.begin() as db:
+                leg = db.get(Leg, leg_id)
+                if not leg or leg.card_id != card_id or leg.source != 'manual':
+                    raise ValueError('只能更新该卡片的 Omni 手工仓位')
+                old_request = db.scalar(select(Event).where(Event.leg_id == leg.id,
+                    Event.kind == 'manual_position', Event.external_id == payload['request_id']))
+                if old_request:
+                    if old_request.raw['request'] != payload:
+                        raise ValueError('同一请求标识不能用于不同内容')
+                    return dict(revision=leg.manual_revision)
+                card = db.get(Card, card_id)
+                if card.status not in ('active', 'reconciling'):
+                    raise ValueError('已结束卡片不能修改手工仓位')
+                if body.expected_revision != leg.manual_revision:
+                    raise ValueError('仓位已更新，请刷新后重试')
+                events = events_for(db, leg)
+                records = manual_records(events)
+                replaced = records[-1] if body.replace_last and records else None
+                if body.replace_last and replaced is None:
+                    raise ValueError('尚无可修订的手工记录')
+                prior = records[:-1] if replaced else records
+                old_qty = D(prior[-1]['data']['qty']) if prior else D(0)
+                old_average = D(prior[-1]['data']['average']) if prior else D(0)
+                qty = D(body.qty)
+                average = D(body.average or '0') if qty else D(0)
+                if qty and average <= 0:
+                    raise ValueError('持仓数量大于零时必须填写正的开仓均价')
+                if qty > old_qty and qty * average - old_qty * old_average <= 0:
+                    raise ValueError('新均价推导出非正的加仓金额，请核对数量和均价')
+                if qty < old_qty:
+                    if body.close_price is None or D(body.close_price) <= 0:
+                        raise ValueError('减仓或清仓必须填写正的实际平仓价')
+                    if qty and average != old_average:
+                        raise ValueError('减仓保持原开仓均价；误录请修订最近记录')
+                    if qty == 0 and not body.confirm_closed:
+                        raise ValueError('清仓必须确认 Omni 实际仓位为零')
+                if qty == old_qty and average != old_average:
+                    raise ValueError('相同数量不能直接改均价；误录请修订最近记录')
+                if qty and body.confirm_closed:
+                    raise ValueError('非零仓位不能确认已清仓')
+                recorded = now_ms()
+                effective = replaced['time'] if replaced else max(recorded, records[-1]['time'] if records else card.started_at)
+                leg.manual_revision += 1
+                data = dict(qty=str(qty), average=str(average), close_price=body.close_price,
+                    fee=body.fee, confirm_closed=body.confirm_closed, revision=leg.manual_revision,
+                    recorded_at=recorded, replaces=replaced['external_id'] if replaced else None)
+                db.add(Event(leg_id=leg.id, account=leg.account, product=leg.product, symbol=leg.symbol,
+                    kind='manual_position', source='manual', external_id=payload['request_id'],
+                    time=effective, data=data, raw=dict(request=payload)))
+                db.flush()
+                self.settle_omni(db, leg, recorded)
+                if old_qty and not qty and not leg.snapshot.get('funding_checkpoint'):
+                    db.add(Event(leg_id=leg.id, account=leg.account, product=leg.product, symbol=leg.symbol,
+                        kind='estimated_funding_gap', source='estimated', external_id='close:' + payload['request_id'],
+                        time=recorded, data=dict(type='ESTIMATED_FUNDING_GAP', start=prior[0]['time'], end=recorded,
+                                               reason='持仓期间无有效结算信息'), raw={}))
+                card.zero_since = None
+                card.revised_at = recorded
+                db.add(Audit(card_id=card_id, message=('修订最近 Omni 仓位并重算受影响估算' if replaced else '手工录入 Omni 仓位')
+                    + f'，版本 {leg.manual_revision}，数量 {qty}' + ('，手动确认清仓' if body.confirm_closed else '')))
+                return dict(revision=leg.manual_revision)
+
+    async def sync_omni(self, leg_id, until):
+        with self.sessions() as db:
+            leg = db.get(Leg, leg_id)
+            symbol = leg.symbol
+        market = await self.adapters['omni', 'perp'].fetch_market_snapshot(symbol)
+        with self.sessions.begin() as db:
+            leg = db.get(Leg, leg_id)
+            self.settle_omni(db, leg, max(until, market['observed_at']), market)
+            leg.error = None
+            leg.synced_at = until
+            db.add(Snapshot(leg_id=leg.id, time=until, data=leg.snapshot))
+
     async def sync_leg(self, leg_id, until):
+        with self.sessions() as db:
+            manual = db.get(Leg, leg_id).source == 'manual'
+        if manual:
+            return await self.sync_omni(leg_id, until)
         with self.sessions() as db:
             leg = db.get(Leg, leg_id)
             card = db.get(Card, leg.card_id)
@@ -200,7 +377,8 @@ class Service:
             if card.status not in ('active', 'reconciling'):
                 return
             legs = [leg_view(db, leg, card.base) for leg in card.legs]
-            healthy = all(x['synced_at'] == until and not x['error'] and not x['issues'] for x in legs)
+            healthy = all((x['manual_entered'] and (x['closed_confirmed'] or x['synced_at'] == until and not x['error']))
+                if x['source'] == 'manual' else x['synced_at'] == until and not x['error'] and not x['issues'] for x in legs)
             traded = all(x['fills'] > 0 for x in legs)
             zero = all(D(x['qty']) == 0 for x in legs)
             if healthy and traded and zero:
@@ -210,7 +388,8 @@ class Service:
                     card.revised_at = until
                     for leg in card.legs:
                         leg.reserved = False
-                    db.add(Audit(card_id=card.id, message='连续两次同步验证双腿归零，自动归档'))
+                    db.add(Audit(card_id=card.id, message='连续两次同步验证双腿归零，自动归档'
+                        + ('（Omni 仓位由用户手动确认）' if any(x['source'] == 'manual' for x in legs) else '')))
                 else:
                     card.zero_since = until
                     card.status = 'reconciling'
@@ -228,6 +407,8 @@ class Service:
                 for card in cards:
                     ids.append(card.id)
                     for leg in card.legs:
+                        if card.status == 'archived' and leg.source == 'manual':
+                            continue
                         # Archived cards receive a daily complete income audit for 90 days.
                         if card.status == 'archived' and (until - card.closed_at > 90 * DAY or leg.synced_at and until - leg.synced_at < DAY):
                             continue

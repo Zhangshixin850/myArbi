@@ -32,6 +32,9 @@ class Leg(Base):
     product: Mapped[str]
     symbol: Mapped[str]
     direction: Mapped[str]
+    source: Mapped[str] = mapped_column(default='exchange', server_default='exchange')
+    quote_asset: Mapped[str] = mapped_column(default='USDT', server_default='USDT')
+    manual_revision: Mapped[int] = mapped_column(default=0, server_default='0')
     # BOTH reserves the whole instrument in one-way mode.
     reservation: Mapped[str]
     reserved: Mapped[bool] = mapped_column(default=True)
@@ -51,6 +54,7 @@ class Event(Base):
     product: Mapped[str]
     symbol: Mapped[str]
     kind: Mapped[str]
+    source: Mapped[str] = mapped_column(default='exchange', server_default='exchange')
     external_id: Mapped[str]
     time: Mapped[int] = mapped_column(BigInteger)
     data: Mapped[dict] = mapped_column(JSON)

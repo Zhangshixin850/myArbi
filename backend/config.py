@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     poll_seconds: int = Field(default=60, ge=10)
     stale_seconds: int = Field(default=180, ge=30)
     snapshot_retention_days: int = Field(default=30, ge=1)
+    omni_enabled: bool = True
     imbalance_ratio: Decimal = Field(default=Decimal('.01'), ge=0)
     max_leverage: Decimal = Field(default=Decimal('5'), gt=0)
     max_margin_usage: Decimal = Field(default=Decimal('.7'), gt=0)

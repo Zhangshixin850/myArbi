@@ -7,22 +7,22 @@
 - Binance 普通账户 USDT 现货多头与 Aster USDT 永续空头。
 - Binance USDT 永续与 Aster USDT 永续的反向双腿。
 - 一个平台一个配置账户；支持读取单向或双向持仓模式，不修改账户模式。
-- 不支持统一/组合保证金、多资产保证金、币本位、Alpha 和其他平台。原有 Lighter/Ondo 文件保留作后续适配参考，未导入运行服务。
+- 支持 Omni 公开永续行情与手工仓位，可与 Binance/Aster 配对。Omni 使用 USDC，按 1:1 近似汇总并明确标为估算。
+- 不支持统一/组合保证金、多资产保证金、币本位、Alpha、Omni swap 和其他平台。原有 Lighter/Ondo 文件保留作后续适配参考，未导入运行服务。
 - 为避免无方向资金费被误分配，同一账户同一合约首版最多归属一张活跃卡片，即使是不同方向。扩展多账户时可通过独立账户隔离。
 
 ## Ubuntu 启动
 
-需要 Docker Engine 与 Compose 插件，域名解析到服务器，开放 80/443。
+完整安装与运行命令见根目录 README 的“Ubuntu + Docker + Tailscale 部署”。当前 Compose 将网页 HTTP 绑定在 `127.0.0.1:8080`，用 Tailscale Serve 提供 tailnet 内 HTTPS；不使用 `SITE_ADDRESS` 或公网 Caddy 证书配置。
 
 ```sh
-cp .env.example .env
+test -e .env || cp .env.example .env
 chmod 600 .env
-# 编辑 .env，至少设置 APP_PASSWORD 和平台凭据
+# 配置 APP_PASSWORD 和所需平台凭据
 docker compose up -d --build
-docker compose logs --tail=100 backend
+sudo tailscale serve --bg http://127.0.0.1:8080
+sudo tailscale serve status
 ```
-
-设置 `SITE_ADDRESS=你的域名` 后 Caddy 自动申请 HTTPS。默认 `localhost` 使用 Caddy 本地证书，只适合本机调试；不要将其当作公网受信证书。后端不映射公网端口。
 
 Binance 使用 API key/secret。Aster 使用 **Pro API V3 agent** 的 user（主账户地址）、signer（agent 地址）和 agent private key；不要填写主钱包私钥。账户须满足 Aster 对该接口的使用条件。密钥只从后端环境读取，不写入数据库、前端或日志。应用只发送 GET 请求，但仍应在平台侧使用允许的最小权限。
 
@@ -52,7 +52,7 @@ npm ci
 npm run dev
 ```
 
-Windows 可使用 `.venv/Scripts/python.exe -m ...` 与 `npm.cmd`。不配置交易所凭据也可运行登录页和空面板，创建卡片按钮会禁用。
+Windows 可使用 `.venv/Scripts/python.exe -m ...` 与 `npm.cmd`。不配置交易所凭据也可运行登录页和空面板；Omni 无需凭据，但必须有另一个已配置平台才能创建双腿卡片。
 
 ```sh
 python -m pytest -q
@@ -108,3 +108,15 @@ docker compose cp backend:/app/backups/arbi-20261118.db ./arbi-20261118.db
 - [Aster V3 文档](https://github.com/asterdex/api-docs/blob/master/V3%28Recommended%29/EN/aster-finance-futures-api-v3.md)
 
 Aster 与 Binance 认证独立实现。接入真实账户后应先核对一组小额、手动执行的开平仓及资金费流水；模拟测试通过不代表已完成真实账户对账。
+
+## Omni 手工仓位与估算
+
+`OMNI_ENABLED=true` 默认启用。公共数据只访问官方 `GET /metadata/v2/stats`，过滤永续市场，每轮共用响应，不调用个人账户或交易接口。单期费率用于估算；年化费率保持原单位；结算时间从 Unix 秒转换为 UTC 毫秒。
+
+手工录入按保存时间生效。加仓录入当前数量和加权均价；减仓保持旧均价并录入实际平仓价；清仓填写零并确认实际仓位归零。每次变更都应及时记录，不能用间隔快照还原期间多轮交易。费用按 USDC 手工输入，默认零。请求带幂等标识和预期版本；最近记录可追加修订，原记录与审计不删除。
+
+每个已知结算节点，使用过期阈值内的结算前公开标记价格和单期费率，以及该节点有效的手工数量估算收付。正费率下多头为负、空头为正。资金费估算单独保存，永远不写成真实收入。断网跨期、周期变化和缺失费率会保留不可恢复缺口，不按当前费率补账。
+
+卡片金额保留 USDC 原币，按 `1 USDC≈1 USDT` 近似汇总，另列估算净利、含浮盈估算总计和估算年化；缺口或账户核对错误导致完整收益未知。归档确认的是仓位结束：Omni 由用户手动确认，自动腿仍需连续两次核对。估算缺口不阻塞仓位结束，归档后继续显示收益不完整。Omni 归档后不继续抓公共行情；自动腿保留原有迟到流水回查。
+
+Omni 账户杠杆、保证金、强平价与 ADL 无公开个人数据来源，显示未知。手工仓位的录入延迟和公开费率预测误差会影响估算。v1.0 没有个人 CSV 导入、历史补录或 Omni 私有 API。

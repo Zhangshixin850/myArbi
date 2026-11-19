@@ -2,30 +2,46 @@ import asyncio
 import logging
 import secrets
 from contextlib import asynccontextmanager, suppress
-from typing import Literal
+from typing import Annotated, Literal
+from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from .adapters import Exchange, ExchangeError
+from .adapters import Exchange, ExchangeError, Omni
 from .config import Settings
 from .db import database
+from .ledger import calculate_manual
 from .models import Audit, Card, Event
-from .service import Service, card_view
+from .service import Service, card_view, events_for
 
 
 class LegInput(BaseModel):
-    account: Literal['binance', 'aster']
+    account: Literal['binance', 'aster', 'omni']
     product: Literal['spot', 'perp']
-    symbol: str = Field(pattern=r'^[A-Z0-9]{3,30}$')
+    symbol: str = Field(pattern=r'^[A-Z0-9][A-Z0-9._-]{2,44}$')
     direction: Literal['LONG', 'SHORT']
 
 
 class CardInput(BaseModel):
     legs: list[LegInput] = Field(min_length=2, max_length=2)
+
+
+DecimalText = Annotated[str, StringConstraints(pattern=r'^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$', max_length=60)]
+
+
+class ManualPositionInput(BaseModel):
+    request_id: UUID
+    expected_revision: int = Field(ge=0)
+    qty: DecimalText
+    average: DecimalText | None = None
+    close_price: DecimalText | None = None
+    fee: DecimalText = '0'
+    confirm_closed: bool = False
+    replace_last: bool = False
 
 
 class ExecutionIntent(BaseModel):
@@ -48,6 +64,8 @@ def create_app(settings=None, adapters=None, sessions=None, background=True):
                 adapters['binance', product] = Exchange('binance', product, settings)
         if settings.aster_user and settings.aster_signer and settings.aster_private_key.get_secret_value():
             adapters['aster', 'perp'] = Exchange('aster', 'perp', settings)
+        if settings.omni_enabled:
+            adapters['omni', 'perp'] = Omni()
     service = Service(sessions, adapters, settings)
 
     @asynccontextmanager
@@ -85,7 +103,9 @@ def create_app(settings=None, adapters=None, sessions=None, background=True):
 
     @app.get('/api/v1/accounts', dependencies=guard)
     def accounts():
-        return {'accounts': [dict(id=a, product=p, execution_enabled=False) for a, p in adapters], 'execution_enabled': False}
+        return {'accounts': [dict(id=a, product=p, execution_enabled=False,
+            source='manual' if a == 'omni' else 'exchange', quote_asset='USDC' if a == 'omni' else 'USDT')
+            for a, p in adapters], 'execution_enabled': False, 'poll_seconds': settings.poll_seconds}
 
     @app.get('/api/v1/markets', dependencies=guard)
     async def markets(account: str, product: str):
@@ -119,8 +139,21 @@ def create_app(settings=None, adapters=None, sessions=None, background=True):
             card = db.get(Card, card_id)
             if not card:
                 raise HTTPException(404, '卡片不存在')
+            estimates = {}
+            for leg in card.legs:
+                if leg.source == 'manual':
+                    estimates.update(calculate_manual(events_for(db, leg), leg.direction)['funding_estimates'])
             rows = db.scalars(select(Event).where(Event.leg_id.in_([l.id for l in card.legs])).order_by(Event.time.desc(), Event.id.desc()).offset(offset).limit(limit))
-            return [dict(id=r.id, leg_id=r.leg_id, account=r.account, kind=r.kind, external_id=r.external_id, time=r.time, data=r.data) for r in rows]
+            return [dict(id=r.id, leg_id=r.leg_id, account=r.account, kind=r.kind, source=r.source,
+                external_id=r.external_id, time=r.time,
+                data=dict(r.data, amount=estimates.get(r.external_id)) if r.kind == 'estimated_funding' else r.data) for r in rows]
+
+    @app.post('/api/v1/cards/{card_id}/legs/{leg_id}/manual-position', dependencies=guard)
+    async def manual_position(card_id: str, leg_id: int, body: ManualPositionInput):
+        try:
+            return await service.save_manual(card_id, leg_id, body)
+        except (ValueError, IntegrityError) as exc:
+            raise HTTPException(409, str(exc) if isinstance(exc, ValueError) else '手工仓位提交冲突，请刷新后重试') from None
 
     @app.get('/api/v1/cards/{card_id}/audit', dependencies=guard)
     def audit(card_id: str):
@@ -135,16 +168,17 @@ def create_app(settings=None, adapters=None, sessions=None, background=True):
                 card = db.get(Card, card_id)
                 if not card or card.status not in ('active', 'reconciling'):
                     raise HTTPException(409, '只能取消未成交的活跃卡片')
-                leg_ids = [leg.id for leg in card.legs]
+                exchange_ids = [leg.id for leg in card.legs if leg.source == 'exchange']
             from .models import now_ms
             try:
-                for leg_id in leg_ids:
+                for leg_id in exchange_ids:
                     await service.sync_leg(leg_id, now_ms())
             except ExchangeError as exc:
                 raise HTTPException(502, str(exc)) from None
             with sessions.begin() as db:
                 card = db.get(Card, card_id)
-                if any(leg.error for leg in card.legs) or db.scalar(select(Event.id).where(Event.leg_id.in_(leg_ids)).limit(1)):
+                manual_traded = any(calculate_manual(events_for(db, leg), leg.direction)['fills'] for leg in card.legs if leg.source == 'manual')
+                if any(leg.error for leg in card.legs if leg.source == 'exchange') or manual_traded or db.scalar(select(Event.id).where(Event.leg_id.in_(exchange_ids)).limit(1)):
                     raise HTTPException(409, '已有流水或核对异常，不能取消')
                 card.status = 'cancelled'
                 for leg in card.legs:

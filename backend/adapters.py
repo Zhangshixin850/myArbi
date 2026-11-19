@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import re
 import time
 from collections import deque
 from decimal import Decimal as D
@@ -227,6 +228,96 @@ class Exchange:
             interval_hours=str(interval) if interval else None,
             daily_rate=str(D(data['lastFundingRate']) * 24 / interval) if interval and data.get('lastFundingRate') else None,
             interval_source='最近两次结算间隔')
+
+    async def close(self):
+        await self.client.aclose()
+
+
+class Omni:
+    """Official public v2 statistics only; never fetch private account endpoints."""
+
+    def __init__(self, transport=None):
+        self.client = httpx.AsyncClient(
+            base_url='https://omni-client-api.prod.ap-northeast-1.variational.io',
+            timeout=15, transport=transport)
+        self.lock = asyncio.Lock()
+        self.markets = {}
+        self.cache = {}
+        self.retry_at = 0
+
+    async def stats(self):
+        async with self.lock:
+            current = time.monotonic()
+            if current < self.retry_at:
+                raise ExchangeError('Omni 公开接口限流，请稍后重试', max(1, int(self.retry_at - current) + 1))
+            cached = self.cache.get('stats')
+            if cached and current - cached[0] < 10:
+                return cached[1], cached[2]
+            try:
+                response = await self.client.get('/metadata/v2/stats')
+                if response.status_code == 429:
+                    try:
+                        delay = max(10, min(3600, int(response.json().get('retry_after_seconds', 10))))
+                    except (ValueError, TypeError, AttributeError):
+                        delay = 10
+                    self.retry_at = time.monotonic() + delay
+                    raise ExchangeError('Omni 公开接口限流，请稍后重试', delay)
+                if response.status_code != 200:
+                    raise ExchangeError('Omni 公开接口失败，HTTP ' + str(response.status_code), 30)
+                data = response.json()
+                if not isinstance(data, dict) or not isinstance(data.get('listings'), list):
+                    raise ValueError()
+            except httpx.HTTPError:
+                raise ExchangeError('Omni 公开接口网络连接失败', 30) from None
+            except (ValueError, TypeError):
+                raise ExchangeError('Omni 公开数据格式异常', 30) from None
+            observed = time.time_ns() // 1_000_000
+            self.cache['stats'] = (time.monotonic(), data, observed)
+            self.markets = {
+                row['ticker']: dict(symbol=row['ticker'], base=row['ticker'][:-5], quote='USDC',
+                                    step=None, source='manual')
+                for row in data['listings'] if isinstance(row, dict) and row.get('contract_type') == 'perpetual'
+                and isinstance(row.get('ticker'), str) and re.fullmatch(r'[A-Z0-9][A-Z0-9._-]{0,39}-PERP', row['ticker'])
+            }
+            return data, observed
+
+    async def fetch_markets(self):
+        await self.stats()
+        return list(self.markets.values())
+
+    async def fetch_market_snapshot(self, symbol):
+        data, observed = await self.stats()
+        row = next((r for r in data['listings'] if isinstance(r, dict) and r.get('ticker') == symbol
+                    and r.get('contract_type') == 'perpetual'), None)
+        if row is None:
+            raise ExchangeError('Omni 永续市场不可用或已下架', 30)
+        try:
+            mark = D(row['mark_price'])
+            if not mark.is_finite() or mark <= 0:
+                raise ValueError()
+        except (KeyError, ValueError, TypeError, ArithmeticError):
+            raise ExchangeError('Omni 标记价格不可用', 30) from None
+        result = dict(mark=str(mark), rate=None, annualized_rate=None, next_funding=None,
+            interval_hours=None, interval_seconds=None, daily_rate=None, observed_at=observed,
+            quote_asset='USDC', equity=None, leverage=None, margin_usage=None,
+            liquidation_price=None, liquidation_distance=None, adl=None)
+        funding = row.get('funding')
+        if funding:
+            try:
+                interval = int(funding['interval_seconds'])
+                next_time = int(funding['next_timestamp']) * 1000
+                rates = funding.get('next') or funding['last']
+                rate = D(rates['interval_rate'])
+                annual = D(rates['annualized_rate'])
+                if interval <= 0 or next_time <= observed or not rate.is_finite() or not annual.is_finite():
+                    raise ValueError()
+                result.update(rate=str(rate), annualized_rate=str(annual), next_funding=next_time,
+                    interval_seconds=interval, interval_hours=str(D(interval) / 3600),
+                    daily_rate=str(rate * D(86400) / interval))
+            except (KeyError, ValueError, TypeError, ArithmeticError):
+                # A price can be usable while funding terms are unavailable.
+                pass
+        return result
 
     async def close(self):
         await self.client.aclose()

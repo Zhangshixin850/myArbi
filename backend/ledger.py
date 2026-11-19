@@ -72,3 +72,71 @@ def summary(legs, at):
     floating = sum((D(x['unrealized']) for x in legs), ZERO) if all(x['unrealized'] is not None for x in legs) else None
     return dict(net=str(net), opened=str(opened), annual=None if annual is None else str(annual),
                 total=None if floating is None else str(net + floating), imbalance=str(imbalance), complete=valid)
+
+
+def manual_records(events):
+    """Corrections supersede the latest position, without deleting the original evidence."""
+    records = [e for e in events if e['kind'] == 'manual_position']
+    replaced = {e['data'].get('replaces') for e in records}
+    return sorted((e for e in records if e['external_id'] not in replaced),
+                  key=lambda e: (e['time'], e['data']['revision']))
+
+
+def manual_quantity_at(records, at):
+    before = [e for e in records if e['time'] <= at]
+    return D(before[-1]['data']['qty']) if before else None
+
+
+def manual_exposed(records, start, end):
+    return bool(manual_quantity_at(records, start)) or any(
+        start < e['time'] <= end and D(e['data']['qty']) > 0 for e in records)
+
+
+def manual_funding_amount(records, data, direction):
+    qty = manual_quantity_at(records, data['settlement_time'])
+    return None if qty is None else qty * D(data['mark']) * D(data['rate']) * (1 if direction == 'SHORT' else -1)
+
+
+def calculate_manual(events, direction, mark=None):
+    records = manual_records(events)
+    qty = average = realized = opened = fees = funding = ZERO
+    first = last = None
+    fills = 0
+    for event in records:
+        row = event['data']
+        new_qty = D(row['qty'])
+        new_average = D(row['average'])
+        fees += D(row['fee'])
+        if new_qty > qty:
+            opened += new_qty * new_average - qty * average
+            first = event['time'] if first is None else first
+        elif new_qty < qty:
+            realized += (D(row['close_price']) - average) * (qty - new_qty) * (1 if direction == 'LONG' else -1)
+        if new_qty != qty:
+            fills += 1
+            last = event['time']
+        qty, average = new_qty, new_average
+    issues = [] if records else ['Omni 仓位待手工录入']
+    estimates = {}
+    for event in events:
+        row = event['data']
+        if event['kind'] == 'estimated_funding':
+            amount = manual_funding_amount(records, row, direction)
+            estimates[event['external_id']] = None if amount is None else str(amount)
+            if amount is None:
+                issues.append('Omni 结算时仓位未知')
+            else:
+                funding += amount
+        elif event['kind'] == 'estimated_funding_gap' and manual_exposed(records, row['start'], row['end']):
+            issues.append('Omni 资金费存在漏采区间，历史无法补造')
+    unrealized = None if not records else ZERO if qty == 0 else None if mark is None else qty * (D(mark) - average) * (1 if direction == 'LONG' else -1)
+    return dict(qty=str(qty), average=str(average), realized=str(realized), fees=str(fees), funding='0',
+        adjustments='0', net=str(realized - fees), opened=str(opened),
+        unrealized=None if unrealized is None else str(unrealized), first=first, last=last, fills=fills,
+        issues=sorted(set(issues)), estimated_funding=str(funding), funding_complete=not any('资金费' in i or '结算' in i for i in issues),
+        funding_estimates=estimates, manual_entered=bool(records),
+        last_manual=dict(records[-1]['data'], time=records[-1]['time'],
+            previous_qty=records[-2]['data']['qty'] if len(records) > 1 else '0',
+            previous_average=records[-2]['data']['average'] if len(records) > 1 else '0') if records else None,
+        closed_confirmed=bool(records and qty == 0 and records[-1]['data']['confirm_closed']),
+        manual_updated_at=max((e['data']['recorded_at'] for e in events if e['kind'] == 'manual_position'), default=None))

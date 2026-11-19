@@ -18,9 +18,7 @@ services:
       options: {max-size: "10m", max-file: "3"}
   web:
     build: frontend
-    environment:
-      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
-    ports: ["80:80", "443:443", "443:443/udp"]
+    ports: ["127.0.0.1:8080:80"]
     restart: unless-stopped
     depends_on:
       backend:
