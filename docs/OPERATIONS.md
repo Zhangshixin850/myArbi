@@ -13,7 +13,7 @@
 
 ## Ubuntu 启动
 
-完整安装与运行命令见根目录 README 的“Ubuntu + Docker + Tailscale 部署”。当前 Compose 将网页 HTTP 绑定在 `127.0.0.1:8080`，用 Tailscale Serve 提供 tailnet 内 HTTPS；不使用 `SITE_ADDRESS` 或公网 Caddy 证书配置。
+完整安装与运行步骤见 [README 的“第一次安装”](../README.MD#第一次安装)。当前 Compose 将网页 HTTP 绑定在 `127.0.0.1:8080`，用 Tailscale Serve 提供 tailnet 内 HTTPS；不使用 `SITE_ADDRESS` 或公网 Caddy 证书配置。
 
 ```sh
 test -e .env || cp .env.example .env

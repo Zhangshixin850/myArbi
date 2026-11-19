@@ -7,193 +7,788 @@ prompt:
 5.将omni平台加入项目，公共信息使用公开api，我自己的仓位数量、开仓均价则手动输入卡片
 使用方法：
 
-# myArbi v1.0
+# myArbi 使用说明
 
-跨平台资金费套利记账与仓位核对。Binance/Aster 从只读 API 自动归集成交及资金流水；Omni 从公开 API 刷新行情和费率，仓位由你手工填写。
+myArbi 是一个帮你记录跨平台资金费套利的网页账本。
 
-**交易在平台手工执行。应用只记账和提示风险，不下单、不撤单、不划转、不自动减仓。**
+例如，你在 Binance 持有一份 ETH 多头，在 Omni 持有相同数量的 ETH 空头。打开这个项目的网页，就可以把两边放在同一张卡片里，查看数量是否对得上、收了多少资金费、花了多少手续费，以及目前赚亏多少。
 
-## 支持范围与口径
+**你仍然需要自己到交易平台开仓和平仓。本项目负责记录和提醒，不会替你下单，也不会在风险过高时自动平仓。**
 
-- Binance 普通账户 USDT 现货多头、USDT 永续；Aster Pro API V3 USDT 永续。
-- Omni 的同币种永续可与上述任一平台配对，方向相反。只接入公开 v2 永续市场，不接入 swap 或私有交易接口。
-- 一个配置账户对应一个平台，同一账户同一合约最多一张活跃卡片。
-- 成本使用移动加权法。双腿平衡按基础币数量比较，默认偏差超过 1% 告警。
-- 年化以双腿累计开仓名义价值之和为分母，加仓增加分母，减仓不减少分母；从首笔记录计时，归档后固定至最后平仓记录。
-- Omni 金额保留 USDC 原额；按 **1 USDC≈1 USDT** 近似汇总。含 Omni 的净利、总收益和年化标记为估算，与纯自动卡片的账本收益分开显示。
+如果你只是想把它装在服务器上使用，不需要先看懂 Python、React 或数据库。
 
-## Ubuntu + Docker + Tailscale 部署
+## 从哪里开始看
 
-需要 64 位 Ubuntu、Git、Docker Engine、Compose 插件和 Tailscale。Docker 内安装运行依赖，服务器无需另装 Python 或 Node.js。
+- 还没安装：从[第一次安装](#第一次安装)开始，按顺序操作。
+- 已经能打开网页：直接看[怎样创建和使用卡片](#怎样创建和使用卡片)。
+- 想使用 Omni：重点看[Omni手工填写完整例子](#omni手工填写完整例子)。
+- 看不懂页面数字：看[页面上的数字是什么意思](#页面上的数字是什么意思)。
+- 想重启、更新或备份：看[日常操作](#日常操作)。
+- 遇到报错：看[常见问题](#常见问题)。
+- 只想在自己的 Windows 电脑试运行：看[在自己电脑上运行](#在自己电脑上运行)。
+- 想改代码或调风险参数：最后看[给开发者和进阶使用者](#给开发者和进阶使用者)。
 
-### 1. 准备工具和代码
+## 先弄清楚几件事
 
-尚未安装 Docker 时，按 [Docker 官方 Ubuntu 安装说明](https://docs.docker.com/engine/install/ubuntu/)安装 Engine 与 Compose 插件。
+### 1. 哪些信息会自动来，哪些需要自己填
 
-```sh
-sudo apt update
-sudo apt install -y git
+| 平台 | 程序自动读取什么 | 你需要做什么 |
+|---|---|---|
+| Binance | 成交、手续费、资金费、持仓及可用风险信息；现货没有资金费 | 在服务器填写 API 凭据，交易仍由你手工进行 |
+| Aster | 成交、手续费、资金费、持仓及可用风险信息 | 填写 Pro API V3 agent 信息，交易仍由你手工进行 |
+| Omni | 公开价格、公开资金费率和结算时间 | 每次交易后，自己填写数量、均价；减仓时再填写平仓价 |
+
+Omni 的资金费是程序根据公开信息**估算**的，不能当成你账户实际收到的金额。Omni 的个人账户风险也读不到，页面显示的“—”表示未知。
+
+### 2. 一张卡片和两条腿是什么
+
+- **一张卡片**：记录你的一组双边交易，例如 Binance 的 ETH 多头，加上 Omni 的 ETH 空头。
+- **一条腿**：这组交易中的一边。上例中 Binance 是一条腿，Omni 是另一条腿。
+- **数量平衡**：比较币的数量。例如一边多 1 ETH、另一边空 1 ETH，数量相同；不是要求两边显示的 USDT 金额相同。
+
+当前可以配对：Binance 现货 + Aster 永续、Binance 永续 + Aster 永续，以及 Binance 或 Aster + Omni 永续。两边要是同一基础币、不同平台、相反方向；Binance 现货只能做多。
+
+“现货”是你实际持有的币；“永续”是交易平台的永续合约产品。本版不接入 Binance Alpha、币本位、组合/多资产保证金、Omni swap，也还没有接入 Lighter 和 Ondo。
+
+### 3. 安装时会用到什么
+
+| 名称 | 通俗理解 |
+|---|---|
+| Ubuntu 服务器 | 一台放在机房、可以一直开机的电脑，程序在它上面运行 |
+| Docker | 帮你把程序和所需环境一起安装、启动的工具 |
+| Docker Compose | 用一组命令一起管理网页和后台程序，命令写作 `docker compose` |
+| Tailscale | 把你的服务器和自己的电脑、手机连到一个私人网络里 |
+| `.env` | 项目的设置文件，保存面板密码和平台 API 凭据 |
+| API 凭据 | 允许程序向平台查询账户信息的身份信息，应在平台设置允许的最小只读权限 |
+
+默认安装方式是：**程序放在 Ubuntu 服务器上，自己的电脑或手机通过 Tailscale 打开网页。** 服务器不需要额外安装 Python 或 Node.js。
+
+## 第一次安装
+
+下面的服务器安装步骤以一台普通的 Ubuntu 服务器为例，建议使用 Ubuntu 24.04 LTS。需要服务器能够访问 GitHub、Docker 的下载站点，以及相关平台 API。
+
+**这些命令是让你在自己的服务器上操作的步骤，本文并不表示已经替你安装到服务器。** 如果原来已有项目和账本，跳到[日常操作](#日常操作)，继续使用原项目目录。
+
+### 第一步：登录服务器，确认你在哪里操作
+
+你可以使用云服务器网页里的远程终端。也可以在自己 Windows 电脑的 PowerShell 中输入：
+
+```powershell
+ssh ubuntu@你的服务器公网IP
+```
+
+把 `ubuntu` 换成云厂商给你的用户名，把“你的服务器公网IP”换成实际 IP。不同服务器可能使用 `root`、`ubuntu` 或其他用户名；按云厂商提供的方式用密码或 SSH 密钥登录。
+
+登录成功以后，后面标注“在服务器执行”的命令，就输入到这个已经连上服务器的窗口里。不要直接输入到尚未登录服务器的 Windows PowerShell 中。
+
+输入 Linux 密码时，屏幕可能不显示星号或文字，输完后按回车即可。
+
+如果你已用 `root` 登录，而且系统提示没有 `sudo` 命令，可以去掉命令最前面的 `sudo`；其他内容保持不变。
+
+### 第二步：安装 Docker
+
+**在服务器执行：**
+
+```bash
 sudo docker --version
 sudo docker compose version
+```
+
+如果两条命令都显示版本号，说明需要的工具已经安装，可以跳到第三步。
+
+如果提示找不到命令，以下步骤适用于尚未安装 Docker 的新 Ubuntu 服务器。使用的是 [Docker 官方 Ubuntu 安装方法](https://docs.docker.com/engine/install/ubuntu/)；若遇到已有软件包冲突，按官方说明处理，不要直接卸载服务器上的其他软件。
+
+先准备下载工具和 Docker 软件源：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl git nano
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+```
+
+接着完整复制下面这一块，从 `. /etc/os-release` 一直到最后一行 `EOF`，一起执行：
+
+```bash
+. /etc/os-release
+sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: ${UBUNTU_CODENAME:-$VERSION_CODENAME}
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+```
+
+这一步告诉 Ubuntu 从 Docker 官方站点下载安装包。不需要你修改里面的系统版本和 CPU 类型，命令会自动读取。
+
+然后安装并启动：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl start docker
+sudo docker --version
+sudo docker compose version
+```
+
+**这一关的检查标准：最后两条命令都能显示版本号。** 如果没有成功，先解决这里的报错，再进行下一步。
+
+### 第三步：下载项目
+
+**在服务器执行：**
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git curl nano
+cd ~
 git clone https://github.com/Zhangshixin850/myArbi.git
 cd myArbi
+pwd
+ls
+```
+
+`git clone` 是下载项目；`cd myArbi` 是进入项目文件夹。`pwd` 显示你当前所在的目录。
+
+**这一关的检查标准：** 当前路径以 `/myArbi` 结尾，`ls` 能看到 `README.MD`、`compose.yaml`、`backend`、`frontend` 等文件或目录。
+
+后面的命令默认你还在这个目录里。重新登录服务器后，可以输入：
+
+```bash
+cd ~/myArbi
+```
+
+本文把项目下载到了当前用户的主目录。如果你自己放在了别的位置，后面所有 `~/myArbi` 都要换成你实际的项目路径。
+
+### 第四步：填写设置文件
+
+**在服务器的 myArbi 目录执行：**
+
+```bash
 test -e .env || cp .env.example .env
 chmod 600 .env
 nano .env
 ```
 
-本次版本标签为 `v1.0`。发布后可执行 `git checkout v1.0` 固定版本；固定标签的 checkout 不使用 `git pull` 更新。
+第一条命令只在 `.env` 不存在时，从模板创建它；已有设置不会因此被覆盖。第二条收紧文件的读取权限，第三条打开编辑器。
 
-### 2. 配置 .env
+编辑器里会看到很多 `名称=内容` 的行。你可以先只改下面这些，其他参数保留默认值。
 
-| 配置 | 用途 |
+**所有人都要设置：**
+
+| 找到这一项 | 等号右边怎么填 |
 |---|---|
-| `APP_USER` | 面板用户名，默认 `admin` |
-| `APP_PASSWORD` | 必须替换为你生成的长随机密码，不能保留模板示例 |
-| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Binance 普通账户只读 API 凭据 |
-| `ASTER_USER` / `ASTER_SIGNER` / `ASTER_PRIVATE_KEY` | Aster 主账户地址、Pro API V3 agent 地址、对应 agent 私钥 |
-| `OMNI_ENABLED` | 默认 `true`，启用 Omni 公共行情和手工仓位，无需 API key |
-| `POLL_SECONDS` / `STALE_SECONDS` | 同步等待间隔，默认 60 秒；数据过期阈值，默认 180 秒 |
-| `SNAPSHOT_RETENTION_DAYS` | 风险快照保留天数，默认 30 |
-| `IMBALANCE_RATIO` | 双腿数量偏差阈值，默认 `0.01` |
-| `MAX_LEVERAGE` / `MAX_MARGIN_USAGE` | 账户杠杆和维持保证金/权益告警阈值，默认 `5`、`0.7` |
-| `MIN_LIQUIDATION_DISTANCE` | 强平距离阈值，默认 `0.1` |
-| `DATABASE_URL` | 本地开发的 SQLite 地址；Compose 固定使用数据卷内数据库 |
+| `APP_USER` | 网页面板用户名，保留 `admin` 也可以 |
+| `APP_PASSWORD` | 你自己设置的长密码；一定替换掉模板里的 `replace-with-a-long-random-password` |
+| `OMNI_ENABLED` | 使用 Omni 时保留 `true` |
 
-Omni 配对至少需要一个已配置的 Binance 或 Aster 平台。未配置自动平台时可以登录，但不能创建双腿卡片。
+**需要用 Binance 时，再填写：**
 
-**Aster 只填写 agent 私钥，不能填写主钱包私钥。** 凭据仅放服务器 `.env`，不要提交 Git 或填到前端。Binance 使用平台允许的最小只读权限。
+| 找到这一项 | 填写来源 |
+|---|---|
+| `BINANCE_API_KEY` | Binance 为你生成的 API Key |
+| `BINANCE_API_SECRET` | 和这个 Key 对应的 Secret |
 
-### 3. 启动并开放私有 HTTPS
+**需要用 Aster 时，再填写：**
 
-按 [Tailscale 官方说明](https://tailscale.com/download/linux)安装并登录；其他访问设备加入同一 tailnet。
+| 找到这一项 | 填写来源 |
+|---|---|
+| `ASTER_USER` | Aster 主账户地址 |
+| `ASTER_SIGNER` | Aster Pro API V3 agent 地址 |
+| `ASTER_PRIVATE_KEY` | 这个 agent 对应的私钥；不要填主钱包私钥 |
 
-```sh
+例如，你只用 **Binance + Omni**，就填写面板用户名和密码、Binance 的两项凭据，并保留 `OMNI_ENABLED=true`。Aster 的三项可以留空。Omni 不需要你填写钱包、私钥或 API Key。
+
+每个平台当前只配置一个账户。不要把面板密码、API Secret 或 agent 私钥发到 GitHub、聊天截图或前端表单里。
+
+填好以后，在 `nano` 里：
+
+1. 按 `Ctrl + O` 保存。
+2. 按回车确认文件名。
+3. 按 `Ctrl + X` 退出。
+
+这里有几种不同的账号，不要混用：服务器账号用来 SSH 登录；Tailscale 账号用来连接私人网络；`APP_USER` / `APP_PASSWORD` 用来登录本项目网页；平台 API 凭据用来读取交易数据。
+
+### 第五步：启动项目
+
+**在服务器的 myArbi 目录执行：**
+
+```bash
+sudo docker compose up -d --build
+```
+
+这条命令会下载运行环境、安装依赖、构建网页并启动程序。第一次需要等待，具体时间取决于服务器和网络。
+
+成功以后检查：
+
+```bash
+sudo docker compose ps
+```
+
+正常情况下，会看到两个服务：
+
+| 名称 | 做什么 | 正常情况 |
+|---|---|---|
+| `backend` | 读取平台数据、保存账本、计算收益 | 显示正在运行，启动后健康检查通过，通常能看到 `healthy` |
+| `web` | 提供你在浏览器里看到的网页 | 显示正在运行，通常能看到 `Up` |
+
+如果 `backend` 一直重启，或显示不健康，先查看最近的报错：
+
+```bash
+sudo docker compose logs --tail=100 backend
+```
+
+`logs` 表示查看运行记录；`--tail=100` 表示只看最近 100 行。最常见的问题是没有设置 `APP_PASSWORD`，或服务器下载依赖失败。
+
+这时程序已经在服务器上启动，但还需要下一步，让你自己的电脑或手机能私下访问它。
+
+### 第六步：安装并登录 Tailscale
+
+Tailscale 可以理解为让你自己的几台设备加入同一个私人网络。服务器和你访问网页的电脑、手机都需要安装并登录。
+
+**先在服务器执行：**
+
+```bash
 curl -fsSL https://tailscale.com/install.sh | sh
 sudo tailscale up
-sudo docker compose up -d --build
-sudo docker compose ps
-sudo docker compose logs --tail=100 backend web
+```
+
+第二条命令通常会给出一个登录地址。复制这个地址，在自己电脑浏览器里打开，按页面要求登录、授权这台服务器。
+
+然后在自己的电脑或手机安装 [Tailscale 客户端](https://tailscale.com/download)，登录同一个 Tailscale 账号，并保持连接。可以按 [Linux 官方安装说明](https://tailscale.com/download/linux)核对服务器安装步骤。
+
+**这一关的检查标准：** 两台设备都显示已连接到 Tailscale。服务器上也可以运行下面的命令查看设备列表：
+
+```bash
+sudo tailscale status
+```
+
+### 第七步：获得网页地址
+
+**回到服务器执行：**
+
+```bash
 sudo tailscale serve --bg http://127.0.0.1:8080
 sudo tailscale serve status
 ```
 
-用 `tailscale serve status` 显示的 HTTPS 地址访问，并用 `APP_USER`、`APP_PASSWORD` 登录。后端首次启动自动执行 Alembic 迁移；SQLite 账本存于 `ledger` 命名卷。
+这会把服务器本机的 myArbi 网页，提供给你的 Tailscale 网络。`--bg` 表示在后台保持这项设置。
 
-当前 Compose 仅绑定 `127.0.0.1:8080`，由 Tailscale Serve 提供私有 HTTPS；无需公网域名或开放公网网页端口。不要启用 Funnel。当前配置不使用 `SITE_ADDRESS`，Caddy 在容器内提供 HTTP 和反向代理。
+第一次使用时，如果命令提示需要启用 HTTPS，并给出一个设置网址，就在浏览器打开它，按提示允许 HTTPS，再重新执行上面的命令。[官方 Serve 说明](https://tailscale.com/docs/features/tailscale-serve)介绍了这个流程。
 
-保持一个 backend 副本和一个 Uvicorn worker。页面每 10 秒读取后端，后台每轮同步完成后等待 `POLL_SECONDS` 再同步。
+**这一关的检查标准：** `serve status` 的输出中出现一个 `https://` 开头、通常以 `.ts.net` 结尾的地址。复制实际输出的地址，不要猜地址。
 
-## 卡片如何使用
+注意：这里用的是 **Serve**，不要改成 **Funnel**。当前配置是给自己的 Tailscale 网络访问，不需要为网页额外开放服务器公网的 80、443 或 8080 端口；SSH 登录端口仍按你的服务器设置保留。
 
-### 自动 API 双腿
+`127.0.0.1` 表示“当前这台设备自己”。因此，你不能在家里的电脑上输入 `http://127.0.0.1:8080` 来访问远处的服务器；应该使用刚才获得的 Tailscale HTTPS 地址。
 
-1. 先创建同币种、跨平台、相反方向的卡片。对应永续方向保持空仓；现货记录原余额基线。
-2. 创建成功后再手工交易。启用之后匹配合约方向的逐笔成交自动归入，包括部分成交后撤单的成交部分。
-3. 加仓、部分减仓持续计入同一卡片。转账、其他同基础币交易、反转持仓可能触发数量核对异常。
-4. 双腿都成交过、账本与账户对应数量均归零且无错误，连续两次同步核对后自动归档。
+### 第八步：在自己的电脑或手机打开网页
 
-### 含 Omni 的双腿
+保持 Tailscale 已连接，在自己电脑或手机的浏览器中打开上一步的 HTTPS 地址。
 
-1. 创建卡片时选择 Omni 永续与一个自动平台，同币种、相反方向。Omni 的空仓前提需要你自行核实。
-2. 手工交易后，点击 Omni 腿的“更新仓位 / 修订”，填写**当前数量与开仓均价**。未录入显示“待录入”，不视为实际空仓。
-3. 每次加仓后更新数量和加权均价；每次减仓填写剩余数量、保持原均价，并填写本次实际平仓均价。可填本次费用，默认零，均以 USDC 计。
-4. 清仓时填写数量 `0`、实际平仓价，并勾选已核实实际仓位为零。自动腿连续两次核对归零后自动归档，审计注明 Omni 为手工确认。
-5. 最近一次录入有误时，勾选“修订最近一次录入”。新修订替代该记录参与重算，原记录仍保留。已归档卡片不能任意改账。
+看到 myArbi 登录页后，填写 `.env` 里的 `APP_USER` 和 `APP_PASSWORD`。这不是你的服务器密码，也不是交易平台的登录密码。
 
-手工记录按保存时间生效，本版没有历史补录。**每次加减仓都应及时录入**；两次录入之间若发生多轮交易，单靠最终数量和均价无法还原期间盈亏。
+**看到“策略账本”页面，就说明安装和网页访问已经打通。** 如果显示没有足够的平台账户，再核对第四步的 API 配置，并重启后台程序。
 
-Omni 的标记价格、单期费率、日化费率、周期和下次结算时间从 [官方公开 v2 API](https://docs.variational.io/technical-documentation/api)获取。资金费按结算节点、手工数量及已保存的结算前行情估算；**不等于你的个人实际到账流水**。公开接口旧版的 `funding_rate` 是年化值，不能作为单期费率计算金额。
+浏览器刷新后可能需要重新登录。程序不会把登录凭据长期保存在浏览器里。
 
-资金费估算仅覆盖开始录入之后且有有效采样的节点。断网、过期快照或漏采区间会显示缺失，暂停完整估算净利及年化，不用当前费率补造历史。仓位已结束时允许归档，但收益缺口会保留。Omni 账户杠杆、保证金、强平价和 ADL 不可获取，显示未知。
+## 怎样创建和使用卡片
 
-## 日常运行、升级和备份
+### 1. 先创建卡片，再到平台交易
 
-```sh
+先点击“创建卡片”，选择两个平台、共同币种以及多空方向，然后点击“启用记账”。
+
+**这一步只创建账本，不会买入或卖出。创建成功以后，才到交易平台手工开仓。**
+
+自动读取的永续方向要先没有仓位，否则程序无法分清哪部分是这张卡片的交易。Omni 的这个前提由你自己核实。
+
+现货可以原来就有币。例如你原有 2 ETH，启用卡片后又买入 0.5 ETH，程序会把原有的 2 ETH 当作起点，这张卡片只跟踪后来增加的部分。
+
+### 2. 选择同一种币，方向相反
+
+例如可以创建：
+
+| 第一边 | 第二边 |
+|---|---|
+| Binance ETH 现货，做多 | Omni ETH 永续，做空 |
+| Binance BTC 永续，做多 | Aster BTC 永续，做空 |
+| Aster ETH 永续，做空 | Omni ETH 永续，做多 |
+
+这些只是功能搭配示例。实际两边交易由你自己完成。
+
+同一平台账户、同一合约，同时只放在一张活跃卡片里。也尽量不要在这个合约上混入另一套无关交易，否则新的成交可能一起被记到这张卡片里。
+
+### 3. 自动读取的平台，交易后等待同步
+
+Binance 和 Aster 成交后，程序会自动获取成交、费用和资金流水。默认每轮同步结束后等待约 60 秒，网页约每 10 秒向后台取一次最新记录，因此刚成交时不一定立刻显示。
+
+可以继续加仓或部分减仓，不需要另外点击“开始平仓”。订单即使只成交了一部分，后来又取消，已经成交的那部分也会记录。
+
+出现暂时的数量差异时，先等下一轮同步；如果持续存在，再看“查看流水”，对照平台的实际成交、持仓及转账记录。
+
+### 4. 两边都平仓后，等待归档
+
+对于自动读取的两边，程序需要确认：两边都实际成交过、账本数量为零、平台对应仓位也为零，并且没有核对错误。连续两轮确认后，卡片才会出现在“历史记录”中。
+
+只平掉一边不会归档。没有任何成交的卡片，可以点“取消”。
+
+## Omni手工填写完整例子
+
+**最重要的是：输入当前还持有多少，而不是这一次买卖了多少。做空也填写正的数量，多空方向已经在卡片里选好了。**
+
+下面假设你建立了一个 Omni ETH 空头卡片。数字仅用来演示填表，价格与实际行情无关，暂不考虑费用。
+
+### 第一次开仓
+
+你在 Omni 做空了 1 ETH，成交均价是 2000 USDC。
+
+在卡片的 Omni 那一边，点击“更新仓位 / 修订”，填写：
+
+| 字段 | 填什么 |
+|---|---|
+| 当前持仓数量 | `1` |
+| 开仓均价 | `2000` |
+| 本次费用 | 确实没有费用时填 `0`；有费用就按实际填 |
+
+点击“保存手工仓位”。数量不要写成 `-1`，也不要把开仓金额 `2000` 填进数量框。
+
+### 后来又加仓
+
+你又做空了 1 ETH，这一笔价格是 2200 USDC。现在一共持有 2 ETH，新的平均开仓价是：
+
+```text
+(1 × 2000 + 1 × 2200) ÷ 2 = 2100 USDC
+```
+
+再次打开“更新仓位 / 修订”，填写**当前总持仓**：
+
+| 字段 | 填什么 |
+|---|---|
+| 当前持仓数量 | `2`，不是本次增加的 `1` |
+| 开仓均价 | `2100`，不是本次成交价 `2200` |
+| 本次费用 | 本次加仓的费用，没有则为 `0` |
+
+实际使用时，优先对照 Omni 页面显示的持仓数量和开仓均价。
+
+### 只平掉一部分
+
+你按 2300 USDC 的价格平掉了 0.5 ETH，现在还剩 1.5 ETH。
+
+这次填写：
+
+| 字段 | 填什么 |
+|---|---|
+| 当前持仓数量 | `1.5`，不是平掉的 `0.5` |
+| 开仓均价 | 保持原来的 `2100`，减仓时界面会保留这个值 |
+| 实际平仓价 | `2300` |
+| 本次费用 | 这次减仓的费用 |
+
+因为例子是空头，平仓价高于开仓价，这次减仓的价差盈亏是亏损；程序会根据你选择的方向计算，不需要你自己输入负数盈亏。
+
+### 全部平仓
+
+后来你按 2050 USDC 平掉剩余的 1.5 ETH，这时填写：
+
+| 字段 | 填什么 |
+|---|---|
+| 当前持仓数量 | `0` |
+| 实际平仓价 | `2050` |
+| 本次费用 | 这次清仓的费用 |
+| 确认选项 | 勾选“我已核实 Omni 实际仓位为零” |
+
+保存后，程序会把 Omni 这一边视为你已手动确认清仓。另一边也平仓并通过连续两轮核对后，卡片才会归档。
+
+### 如果刚才填错了
+
+重新打开编辑窗口，勾选“修订最近一次录入”，修改错误内容后保存。
+
+这个功能修正的是最近一条记录，不是又做了一笔新交易。程序会重新计算相关收益，同时保留原记录和修改痕迹。
+
+目前只能修订最近一条，不能任意修改更早历史，也不能在归档后直接改账。
+
+### Omni使用时还要注意什么
+
+- 每次加仓、减仓后及时记录。程序按你保存记录的时间生效，不会自动知道你几小时前成交过什么。
+- 两次录入之间如果经历多次开平仓，只抄最后的数量和均价，无法完整还原中间的盈亏。
+- 公共行情刷新不代表你的个人持仓也刷新。看到行情变动后，仍要自己更新仓位数量。
+- 出现“资金费有缺口”时，表示有些结算时刻没有足够信息，程序不能知道这一段到底收付多少。它不会把缺失金额算成零，也不会用当前费率补造历史。
+- 有资金费缺口但两边已经平仓的卡片，可以结束并归档，缺口会继续保留在历史中。
+
+## 页面上的数字是什么意思
+
+### 已实现净利和浮盈有什么区别
+
+**已实现净利**可以理解为：已经记录到的平仓价差收益，加上实际资金费及已识别的返佣等调整，再减去已记录的手续费。
+
+手续费会在成交后计入，所以刚开仓时，已实现净利出现负数并不一定是算错了，可能只是先扣了开仓手续费。
+
+**浮盈**是尚未平掉的仓位，按当前价格计算的暂时赚亏。价格继续变化，浮盈也会变化。
+
+**含浮盈总计**就是把两部分放在一起看，但没有平仓之前，它不是最终落袋收益。
+
+含 Omni 的卡片会显示“估算净利”“估算名义资金年化”等文字，因为里面包含手工记录、公开资金费估算和币种近似换算。
+
+### 为什么 Omni 写着USDC，汇总却显示接近USDT
+
+Binance/Aster 的本项目记录主要以 USDT 计，Omni 的价格和费用以 USDC 计。
+
+你选择的处理方式是先按 **1 USDC 约等于 1 USDT** 放在一起比较。因此页面会带有“≈”或“估算”。这不是精确汇兑，两个稳定币出现价差时，实际结果会不同。
+
+### 年化是怎么算的
+
+这里的年化回答的是：“按这张卡片目前的收益和运行时间折算成一年，大约是什么比例？”它不是未来一年的保证收益，也不是按实际保证金算的回报。
+
+例如两边最初各开了相当于 1000 USDT 的仓位，计算用的开仓金额就是 2000。若运行 10 天、已实现净利是 20，则折算为：
+
+```text
+20 ÷ 2000 × 365 ÷ 10 = 0.365，即约 36.5%
+```
+
+后面继续加仓，计算用的累计开仓金额会增加；部分减仓不会把这部分累计金额减回去。计时从首笔成交或手工开仓记录开始，归档后固定到最后平仓记录。
+
+刚开始运行、时间很短时，年化可能很大。数据有问题或估算缺失时，先核对原始记录，不要单看这个数字。
+
+### 数量偏差是什么
+
+比如一边多 1 ETH、另一边空 0.99 ETH，数量差是 0.01 ETH，相对于较大一边是 1%。默认超过 1% 才提示数量不平衡。
+
+它比较的是币的数量。即使两边数量一样，由于价格不同，页面显示的持仓金额也可能不一样。
+
+### 几种状态和风险提示
+
+| 页面文字 | 你可以怎样理解 |
+|---|---|
+| 记账中 | 这张卡片还在跟踪，可能尚未开仓，也可能仍有持仓 |
+| 待核对 | 可能在等平仓后的第二轮确认，也可能有数量、同步或费用问题；不能只凭这个状态判断是否已平仓 |
+| 已归档 | 系统完成了结束检查；含 Omni 时，Omni 空仓来自你的手动确认 |
+| 待录入 | Omni 的仓位还没填，程序并不知道实际数量 |
+| — | 对应信息未知或暂时不能计算，不表示风险或金额为零 |
+| 数据过期 | 最近一段时间没有成功刷新，先检查后台和平台连接 |
+| 接近强平价格 / ADL风险 | 风险提醒，需要你到平台核实并自行处理，程序不会自动减仓 |
+
+“账户杠杆”和“保证金占用率”反映账户整体情况，可能包含账户里的其他合约，不只是这一张卡片。账户杠杆也不等同于你在平台下单页面选择的杠杆倍数。
+
+当前仍有已知问题需要注意：同合约的另一方向若已有无关持仓，自动平台资金费可能混入；纯自动卡片出现核对异常时，仍可能显示年化。遇到这些情况以平台原始记录核对，详细内容见 [v1.0 复查报告](docs/REVIEW-v1.0.md)。
+
+## 日常操作
+
+这一节除特别说明外，都是在**服务器的原 myArbi 项目目录**执行。本文默认路径为 `~/myArbi`。
+
+### 查看程序有没有在运行
+
+```bash
+cd ~/myArbi
 sudo docker compose ps
+```
+
+看到 `backend`、`web` 正常运行即可。想查看最近报错：
+
+```bash
 sudo docker compose logs --tail=100 backend
-# 修改 .env 后重新创建后端
+```
+
+这只是查看记录，不会清空或重建账本。
+
+### 修改密码或平台API以后，怎样让设置生效
+
+```bash
+cd ~/myArbi
+nano .env
+```
+
+保存退出后执行：
+
+```bash
 sudo docker compose up -d --force-recreate backend
-# 停止 / 启动，保留数据卷
+```
+
+这会重新创建后台容器并读取新设置，账本数据仍保留。若改的是面板密码，之后用新密码重新登录网页。
+
+### 暂时停止和重新启动
+
+停止：
+
+```bash
+cd ~/myArbi
 sudo docker compose down
+```
+
+重新启动：
+
+```bash
+cd ~/myArbi
 sudo docker compose up -d
 ```
 
-**不要执行 `docker compose down -v`，它会删除账本数据卷。**
+`-d` 表示程序在后台运行，正常启动后可以关闭远程终端窗口。
 
-升级前先使用 SQLite backup API 备份，不能在运行中只复制 `.db` 而忽略 WAL。把下面日期替换为本次唯一文件名，目标文件必须尚不存在：
+停止期间不会同步，也不会保护或处理你在平台上的持仓；Omni 若跨过结算节点，可能产生无法补回的估算缺口。
 
-```sh
-sudo docker compose exec backend python scripts/backup.py /app/data/arbi.db /app/backups/arbi-YYYYMMDD.db
-sudo docker compose cp backend:/app/backups/arbi-YYYYMMDD.db ./arbi-YYYYMMDD.db
-# 跟踪 main 的工作区更新
+**不要在停止命令后加 `-v`。`docker compose down -v` 会把存账本的数据卷一起删除。**
+
+### 账本到底保存在哪里
+
+使用 Docker 方式运行时，账本保存在 Docker 管理的 `ledger` 数据卷里。可以把它理解成专门放记录的持久文件夹，重建程序容器通常不会删除它。
+
+因此，Docker 部署时，项目目录下的 `data/arbi.db` 不一定是正在使用的正式账本；本机开发运行时默认才使用这个路径。
+
+日常更新一直使用原项目目录。新建另一个目录再启动，可能连到另一组数据卷，看到空面板并不一定表示原账本已经被删。
+
+### 怎样备份
+
+更新程序前建议先做一次备份。下面命令会生成一个带当前时间的文件名，避免覆盖已有备份。
+
+**在服务器执行：**
+
+```bash
+cd ~/myArbi
+backup_name="arbi-$(date +%Y%m%d-%H%M%S).db"
+sudo docker compose exec backend python scripts/backup.py /app/data/arbi.db "/app/backups/$backup_name"
+sudo docker compose cp "backend:/app/backups/$backup_name" "./$backup_name"
+ls -lh "$backup_name"
+```
+
+这几行要在同一个终端连续执行。成功时，会看到 `Backup verified`，最后一行能看到项目目录中生成的备份文件。
+
+第一条备份命令使用项目提供的工具，确保程序运行中也能取得完整的 SQLite 备份；第二条把备份文件从容器里复制到服务器项目目录。不要用直接复制正在使用的 `.db` 文件来代替它。
+
+还应把备份另存到自己的电脑。可以用云厂商的文件下载功能、SFTP 软件，或者在**自己 Windows 电脑的 PowerShell** 中运行下面的格式：
+
+```powershell
+scp ubuntu@你的服务器公网IP:~/myArbi/实际备份文件名.db .
+```
+
+把用户名、IP、项目路径和文件名都换成实际值。最后的 `.` 表示下载到电脑当前目录。
+
+恢复备份需要先停后台，并避开旧数据库配套文件的干扰，不是把备份直接覆盖上去。具体步骤见 [运维说明的备份和恢复](docs/OPERATIONS.md#备份和恢复)。
+
+### 怎样更新到GitHub上的新代码
+
+先按上一小节完成备份，然后在原项目目录执行：
+
+```bash
+cd ~/myArbi
+git branch --show-current
+```
+
+如果显示 `main`，执行：
+
+```bash
 git pull --ff-only
 sudo docker compose up -d --build
-sudo docker compose logs --tail=100 backend
+sudo docker compose ps
 ```
 
-固定标签的工作区使用 `git fetch --tags` 后 `git checkout 新版本标签`，再构建启动。迁移只向前升级，不重建已有账本。备份应另存到服务器之外。恢复前停止 backend，使用新数据卷并检查完整性，详见 [运维说明](docs/OPERATIONS.md#备份和恢复)。
+`git pull` 下载新代码；`--build` 根据新代码重新构建。`--ff-only` 在历史不能直接前进时会报错，不会替你强行覆盖代码。看到冲突或本地修改提示时，先保留现场处理，不使用强制重置命令。
 
-## 本地开发运行
+后台启动会自动升级所需数据库结构，已有账本不会因为正常升级而重建。`.env` 不从 GitHub 下载，因此原来的个人配置会保留。
 
-需要 Python 3.10+（建议 3.12）、Node.js 22+ 和 npm。前后端分别在两个终端运行。只在回环地址使用开发 HTTP。
+如果 `git branch --show-current` 没有输出，你可能固定在 `v1.0` 这样的版本标签上。想改为跟随最新 `main` 时，先执行 `git switch main`，成功后再运行上面的更新命令；如果要继续固定版本，就保持当前标签，日后再选择明确的新标签更新。
 
-Linux/macOS 项目根目录：
+`v1.0` 是已经发布的一个固定版本标记，不会随着后续 README 或代码修改自动移动。GitHub 默认的 `main` 分支展示最新说明。
 
-```sh
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.lock
-test -e .env || cp .env.example .env
-# 编辑 .env，设置 APP_PASSWORD 和所需平台凭据
-python -m alembic upgrade head
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --no-access-log
+如果出现 `not a git repository`，先确认是否进入了原项目目录。若原来是下载 ZIP 后解压的文件夹，它没有 Git 的更新记录，不能直接使用 `git pull`；应先保留原目录、配置和备份，再按完整迁移流程更新，不要用新下载的文件直接覆盖账本。
+
+## 常见问题
+
+### 网页打不开，先查哪一边
+
+按顺序检查：
+
+1. 自己电脑或手机的 Tailscale 是否已连接。
+2. 服务器运行 `sudo tailscale status`，是否仍在网络里。
+3. 在项目目录运行 `sudo docker compose ps`，两个服务是否正常。
+4. 运行 `sudo tailscale serve status`，用它显示的实际 HTTPS 地址访问。
+
+不要直接用“服务器公网 IP 加 8080”访问，当前网页端口只监听服务器本机。
+
+### 能看到登录页，但密码不对
+
+填写的是 `.env` 的 `APP_USER` 和 `APP_PASSWORD`。如果改过 `.env`，还要运行重新创建后台的命令，然后再用新密码登录。
+
+### 只有Omni，或者创建卡片按钮是灰色
+
+Omni 不用密钥，所以默认就能出现在平台列表里。但它需要和另一个平台配对；请补齐 Binance 或 Aster 的配置，再重新创建后台。
+
+同一个 Binance 平台里的现货和永续，也不能当作两个不同平台来创建本项目的跨平台卡片。
+
+### 一直提示平台认证失败
+
+核对 API 信息是否完整、平台权限和服务器时间是否正确。Aster 必须使用 Pro API V3 的 agent 信息，不能把主钱包私钥当作 agent 私钥。
+
+不要把完整 `.env` 或私钥截图发出来排错。
+
+### 提示“仓位已更新，请刷新后重试”
+
+可能另一个网页窗口已经保存了新数据。关闭手工编辑窗口，刷新卡片后重新打开，再对照最新仓位填写。
+
+### 提示账户数量与账本不符
+
+先等下一轮完整同步。如果仍然不符，对照平台的逐笔成交、转账和实际持仓，看看是否有漏记录、其他交易或方向变化。
+
+现货原有余额、基础币手续费和其他基础币交易也会影响数量。不要通过删除流水或填一笔不存在的交易来让数字表面相等。
+
+### 两边都平了，为什么还没有归档
+
+自动平台需要连续两轮核对通过；Omni 还必须保存零数量并确认实际仓位为零。少量残余数量、未估值费用、同步失败或其他核对错误，都可能使卡片继续等待。
+
+没有任何成交的卡片需要点“取消”，不会自动变成一笔已完成策略。
+
+### Omni资金费显示“有缺口”或收益是“—”
+
+程序缺少某些结算节点的数据，或者对应仓位尚未录入。公开 API 没有完整的个人历史记录，重新启动后也不能自动还原所有缺失金额。
+
+“—”表示未知，不能当成零。资金费估算完整性与仓位是否结束是两件事，归档卡片也可能保留收益缺口。
+
+### 退出SSH或重启服务器以后，程序还在吗
+
+Docker 服务正常运行时，使用 `up -d` 启动的程序不依赖 SSH 窗口。服务器重启后，容器能否恢复还取决于 Docker 服务是否已自动启动；可以用 `sudo docker compose ps` 检查。
+
+Tailscale 是否已连接、Serve 是否生效，分别用 `sudo tailscale status` 和 `sudo tailscale serve status` 检查。
+
+## 在自己电脑上运行
+
+这一节是另一种运行方式，供你在自己的电脑上试用或开发。**如果已经用前面的 Ubuntu + Docker 方式部署，不必再做这一节。**
+
+本机运行需要自己安装 Python 3.10 或更新版本、Node.js 22 或更新版本，以及 Git。建议 Python 3.12。网页和后台分别启动，需要两个终端窗口。
+
+### Windows电脑
+
+先用 Git 下载项目并进入目录；如果已经有项目，就进入原有目录，不要重复下载覆盖。
+
+```powershell
+git clone https://github.com/Zhangshixin850/myArbi.git
+cd myArbi
 ```
 
-Windows PowerShell 无需激活环境：
+**第一个 PowerShell 窗口：启动后台。**
 
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.lock
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 notepad .env
+```
+
+在记事本中设置面板密码和平台凭据，保存文件并关闭记事本后，继续：
+
+```powershell
 .\.venv\Scripts\python.exe -m alembic upgrade head
 .\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
-另开终端：
+`alembic upgrade head` 为本机数据库建立或升级结构；`uvicorn` 启动后台。看到类似 `Application startup complete`，且没有报错时，保持这个窗口开着。
 
-```sh
+**第二个 PowerShell 窗口：进入同一个项目目录，启动网页。**
+
+```powershell
+cd 你的项目实际路径\myArbi
+cd frontend
+npm.cmd ci
+npm.cmd run dev
+```
+
+将“你的项目实际路径”换成你保存项目的位置。`npm.cmd ci` 安装网页所需依赖；成功后，`npm.cmd run dev` 启动本地网页服务。
+
+在这台电脑的浏览器打开终端显示的 Local 地址，默认是 `http://127.0.0.1:5173`；若端口已被占用，以终端实际显示的地址为准。
+
+需要停止时，在两个窗口分别按 `Ctrl + C`。本机默认账本为项目下的 `data/arbi.db`，与远程 Docker 服务器的账本不是同一份。
+
+如果 `.venv` 提示找不到某个旧 Python 路径，说明它可能是从其他机器拷来的，需要在本机重新创建，不要直接沿用旧虚拟环境。
+
+### Linux或macOS电脑
+
+在项目根目录启动后台：
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.lock
+test -e .env || cp .env.example .env
+```
+
+编辑 `.env`，至少设置面板密码和所需平台凭据，然后运行：
+
+```bash
+python -m alembic upgrade head
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --no-access-log
+```
+
+另开一个终端，进入同一个项目目录后运行：
+
+```bash
 cd frontend
 npm ci
 npm run dev
 ```
 
-Windows 使用 `npm.cmd ci`、`npm.cmd run dev`。打开 `http://127.0.0.1:5173`，Vite 将 `/api` 转发至后端。健康检查为 `http://127.0.0.1:8000/healthz`。两个终端分别按 `Ctrl+C` 停止；本地账本默认 `data/arbi.db`。
+浏览器地址和停止方法与上面的 Windows 说明相同。本机 HTTP 地址只供这台电脑试用；服务器远程访问仍使用前面的 HTTPS 方式。
 
-## 验证与排错
+## 给开发者和进阶使用者
 
-```sh
+只想正常使用面板时，可以跳过这一节。
+
+### 风险和运行参数
+
+这些选项都在 `.env`，改完后需要重新创建后台容器。本版风险参数只影响提醒，不会触发自动交易。
+
+| 配置项 | 默认值 | 通俗说明 |
+|---|---|---|
+| `POLL_SECONDS` | `60` | 每轮同步结束后等多少秒再同步 |
+| `STALE_SECONDS` | `180` | 多久没成功刷新，就提示数据过期；也是 Omni 结算前快照的有效时间阈值 |
+| `SNAPSHOT_RETENTION_DAYS` | `30` | 保存多少天的风险快照；不等于只保存 30 天账本 |
+| `IMBALANCE_RATIO` | `0.01` | 双腿数量偏差超过 1% 时提醒 |
+| `MAX_LEVERAGE` | `5` | 账户总持仓名义金额/权益达到 5 倍时提醒 |
+| `MAX_MARGIN_USAGE` | `0.7` | 维持保证金/保证金权益达到 70% 时提醒，不冒充平台所有定义下的 MMR |
+| `MIN_LIQUIDATION_DISTANCE` | `0.1` | 标记价格与强平价的距离比例不超过 10% 时提醒 |
+| `OMNI_ENABLED` | `true` | 是否提供 Omni 公开行情和手工仓位功能 |
+| `DATABASE_URL` | `sqlite:///data/arbi.db` | 本机开发时的数据库地址；Docker 中由 compose.yaml 指向数据卷 |
+
+### 实现和数据边界
+
+- 后台是 FastAPI，网页是 React，账本是 SQLite；只运行一个后台实例和一个 Uvicorn worker。
+- 页面约每 10 秒读取后台。后台默认约每分钟同步，不提供实时强平保护。
+- Omni 只读取官方公开 `/metadata/v2/stats` 的永续市场，不读取个人账户。使用单期费率估算收付，年化费率独立展示，详见 [Omni 官方 API](https://docs.variational.io/technical-documentation/api)。
+- 自动平台常规成交重叠回查 5 分钟，资金流水重叠回查 1 天；每天额外回查最多最近 90 天。归档后保留一定期限的迟到流水回查。
+- 手工记录、公开估算与实际平台流水保留不同来源；Omni 估算不写成真实到账资金费。
+- 后台启动时自动升级数据库；已发布迁移文件不能随意改写，更不能通过重建数据库完成普通升级。
+
+### 开发验证
+
+在安装好依赖并进入虚拟环境后，可在项目根目录运行：
+
+```bash
 python -m pytest -q
 python -m pip check
-# 使用临时 DATABASE_URL 验证迁移，避免操作真实账本
-python -m alembic upgrade head
-python -m alembic check
+```
+
+Windows 无需激活环境，可改用：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pip check
+```
+
+前端生产构建：
+
+```bash
 cd frontend
 npm ci
 npm run build
 ```
 
-Windows 对应使用 `.venv/Scripts/python.exe` 和 `npm.cmd`。单独构建前端不会启动后端。
+Windows 对应使用 `npm.cmd`。构建结果在 `frontend/dist`；单独构建网页不会启动后台。数据库迁移测试要指定独立的临时 `DATABASE_URL`，不要拿真实账本做实验。
 
-| 现象 | 处理 |
+### 其他说明文档
+
+| 文档 | 看什么 |
 |---|---|
-| 后端提示 Set APP_PASSWORD | 设置根目录 `.env` 的非空面板密码并重启 |
-| 只有 Omni、创建按钮禁用 | 补齐至少一个 Binance 或 Aster 账户配置 |
-| 手工提交提示刷新 | 其他页面已修改仓位；关闭编辑器、刷新后重开 |
-| Omni 资金费有缺口 | 查看估算漏采流水；公开 API 无历史补账能力，不能将缺失当零 |
-| 数量不符或费用待估值 | 对照平台成交及转账，不删除流水掩盖差异 |
-| npm.ps1 被禁止执行 | 使用 `npm.cmd`，无需改变执行策略 |
-| 复制来的 .venv 提示 No Python | 使用本机 Python 重新创建虚拟环境，不沿用其他机器的环境 |
+| [运维说明](docs/OPERATIONS.md) | 更详细的运行、账务口径和恢复说明 |
+| [架构与接口](docs/ARCHITECTURE.md) | 后台模块、API 和数据怎么流转 |
+| [原始需求存档](docs/REQUIREMENTS.md) | 最初的功能设想，部分内容尚未实现 |
+| [v1.0 复查报告](docs/REVIEW-v1.0.md) | 已修复问题、保留缺陷及修改建议 |
+| [验证记录](docs/VALIDATION.md) | 已通过哪些检查，哪些还未验证 |
 
-详细变更、已知问题和验证限制见 [v1.0 复查报告](docs/REVIEW-v1.0.md)、[验证记录](docs/VALIDATION.md)和[架构与 API](docs/ARCHITECTURE.md)。真实账户对账、Docker 实机验证和浏览器视觉验证分别记录，不以模拟测试代替。
+上一轮功能验证通过了 43 项自动测试、前端构建、数据库迁移和备份检查，也实测了 Omni 公开 API。真实个人账户对账、Ubuntu Docker 实机运行和浏览器视觉验收尚未完成；这些验证范围分别记录，不把模拟测试当作实盘验收。
